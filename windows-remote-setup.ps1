@@ -13,6 +13,11 @@
 
     Safe to run multiple times. The script is idempotent.
 
+    Elevation: if the current prompt is already elevated, the script runs
+    directly. Otherwise it relaunches itself through UAC. When the script was
+    loaded from memory with iwr + iex (no local file), the elevated instance
+    re-downloads the same URL and runs that.
+
 .PARAMETER PublicKey
     Public key line to install for the administrators group, for example:
     "ssh-ed25519 AAAAC3... user@host". When a valid key is supplied, password
@@ -42,6 +47,9 @@
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\windows-remote-setup.ps1 -RestrictToTailnet
+
+.EXAMPLE
+    & ([scriptblock]::Create((iwr -UseBasicParsing https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/windows-remote-setup.ps1).Content))
 #>
 
 #Requires -Version 5.1
@@ -63,6 +71,7 @@ $ErrorActionPreference = 'Stop'
 $LogPath     = Join-Path $env:ProgramData 'remote-access-setup.log'
 $SshdConfig  = Join-Path $env:ProgramData 'ssh\sshd_config'
 $AdminKeys   = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+$ScriptSourceUrl = 'https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/windows-remote-setup.ps1'
 $script:Warnings = New-Object System.Collections.Generic.List[string]
 
 function Write-Step {
@@ -93,22 +102,31 @@ function Test-Administrator {
 # ---------------------------------------------------------------------------
 if (-not (Test-Administrator)) {
     Write-Host 'Requesting administrator privileges...' -ForegroundColor Yellow
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
-        Write-Host 'Run this script from an elevated PowerShell (self-elevation needs -File).' -ForegroundColor Red
-        exit 1
-    }
-    $elevationArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
+
+    $scriptArgs = @()
     foreach ($key in $PSBoundParameters.Keys) {
         $value = $PSBoundParameters[$key]
         if ($value -is [System.Management.Automation.SwitchParameter]) {
-            if ($value.IsPresent) { $elevationArgs += "-$key" }
+            if ($value.IsPresent) { $scriptArgs += "-$key" }
         }
         else {
-            $elevationArgs += "-$key"
-            $elevationArgs += ('"{0}"' -f $value)
+            $scriptArgs += "-$key"
+            $scriptArgs += ('"{0}"' -f $value)
         }
     }
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ($elevationArgs -join ' ') | Out-Null
+
+    $fromFile = (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) -and (Test-Path -LiteralPath $PSCommandPath)
+    if ($fromFile) {
+        $launch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath)) + $scriptArgs
+    }
+    else {
+        # Invoked from memory (iwr + iex / scriptblock). Re-download in the elevated window.
+        $inner = '& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing ''{0}'').Content))' -f $ScriptSourceUrl
+        if ($scriptArgs.Count -gt 0) { $inner = $inner + ' ' + ($scriptArgs -join ' ') }
+        $launch = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $inner)
+    }
+
+    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ($launch -join ' ') | Out-Null
     exit
 }
 

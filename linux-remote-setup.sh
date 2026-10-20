@@ -13,6 +13,7 @@
 #
 # Usage:
 #   ./linux-remote-setup.sh [--allow-lan] [--tailscale-ssh]
+#   curl -fsSL <raw-url> | sudo bash -s -- [--allow-lan]
 #
 #   --allow-lan      also allow SSH on the local network (opens tcp/22)
 #   --tailscale-ssh  enable Tailscale SSH (keyless, identity based) in addition to sshd
@@ -21,15 +22,35 @@
 
 set -euo pipefail
 
+SELF="${BASH_SOURCE[0]:-}"
+if [ -n "$SELF" ] && [ -f "$SELF" ]; then
+    SELF="$(readlink -f -- "$SELF")"
+fi
+
 ALLOW_LAN=0
 TAILSCALE_SSH=0
+
+usage() {
+    cat <<'EOF'
+linux-remote-setup.sh - one-shot SSH access setup for CachyOS / Arch
+
+Usage:
+  sudo bash linux-remote-setup.sh [options]
+  curl -fsSL <raw-url> | sudo bash -s -- [options]
+
+Options:
+  --allow-lan      also allow SSH on the local network (opens tcp/22)
+  --tailscale-ssh  enable Tailscale SSH (identity based) in addition to sshd
+  -h, --help       show this help
+EOF
+}
 
 for arg in "$@"; do
     case "$arg" in
         --allow-lan)     ALLOW_LAN=1 ;;
         --tailscale-ssh) TAILSCALE_SSH=1 ;;
         -h|--help)
-            sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+            usage
             exit 0
             ;;
         *)
@@ -40,7 +61,12 @@ for arg in "$@"; do
 done
 
 if [ "$(id -u)" -ne 0 ]; then
-    exec sudo -- "$0" "$@"
+    if [ -n "$SELF" ] && [ -f "$SELF" ]; then
+        exec sudo -- bash "$SELF" "$@"
+    fi
+    echo "Not running as root and no script path is available (piped mode)." >&2
+    echo "Re-run as: curl -fsSL <raw-url> | sudo bash" >&2
+    exit 1
 fi
 
 log()  { printf '==> %s\n' "$*"; }

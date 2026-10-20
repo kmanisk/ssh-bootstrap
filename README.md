@@ -13,17 +13,32 @@ Both scripts are idempotent: running them again is safe and does not duplicate c
 
 ## Windows
 
-Run from PowerShell. Administrator rights are not required up front; the script self-elevates through UAC.
+Run from PowerShell. No git, no clone, no saved file.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; iwr https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/windows-remote-setup.ps1 -OutFile $env:TEMP\win-setup.ps1; & $env:TEMP\win-setup.ps1"
+& ([scriptblock]::Create((iwr -UseBasicParsing https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/windows-remote-setup.ps1).Content))
 ```
 
 With a public key (password authentication is then disabled automatically):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; iwr https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/windows-remote-setup.ps1 -OutFile $env:TEMP\win-setup.ps1; & $env:TEMP\win-setup.ps1 -PublicKey 'ssh-ed25519 AAAAC3Nza... user@linux'"
+& ([scriptblock]::Create((iwr -UseBasicParsing https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/windows-remote-setup.ps1).Content)) -PublicKey 'ssh-ed25519 AAAAC3Nza... user@linux'
 ```
+
+Elevation behaves like this:
+
+- Already elevated (`Administrator: Windows PowerShell`): the script runs directly, no second window.
+- Normal prompt: the script relaunches itself through UAC.
+- Loaded from memory with `iwr` (the form above): the elevated instance downloads the same URL again and runs there.
+
+If you prefer a saved file (useful for the log path and for `-File`), the equivalent one-liner is:
+
+```powershell
+iwr -UseBasicParsing https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/windows-remote-setup.ps1 -OutFile $env:TEMP\win-setup.ps1; & $env:TEMP\win-setup.ps1
+```
+
+Older PowerShell 5.1 builds may negotiate an outdated TLS version. If the download fails, prefix the command with
+`[Net.ServicePointManager]::SecurityProtocol='Tls12';`.
 
 ### Parameters
 
@@ -44,10 +59,22 @@ The script backs up `sshd_config` to `sshd_config.bak` on first run and edits di
 ## Linux
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/linux-remote-setup.sh | sudo bash
+```
+
+With flags:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/linux-remote-setup.sh | sudo bash -s -- --allow-lan
+```
+
+Or as a saved file (the script then re-executes itself with `sudo`, so plain `bash linux-setup.sh` works too):
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/main/linux-remote-setup.sh -o /tmp/linux-setup.sh && bash /tmp/linux-setup.sh
 ```
 
-The script re-executes itself with `sudo`.
+When the script is piped into `bash`, it cannot re-execute itself (there is no file path), so it must already run as root. That is why the one-liner uses `sudo bash`.
 
 Flags:
 
