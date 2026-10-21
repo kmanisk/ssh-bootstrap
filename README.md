@@ -6,7 +6,7 @@ Two scripts, one per platform:
 
 | File | Platform | What it does |
 |---|---|---|
-| `windows-remote-setup.ps1` | Windows 10 1809+ / 11 | Installs OpenSSH Server, sets PowerShell as the default shell, configures `sshd_config`, optional public key, firewall rule, Tailscale, and power settings that keep the machine reachable |
+| `windows-remote-setup.ps1` | Windows 10 1809+ / 11 | Installs OpenSSH Server (winget `Microsoft.OpenSSH.Preview`, optional feature as fallback), sets PowerShell as the default shell, configures `sshd_config`, optional public key, firewall rule, Tailscale, and power settings that keep the machine reachable |
 | `linux-remote-setup.sh` | CachyOS / Arch | Installs `tailscale` and `openssh`, enables `sshd` and `tailscaled`, allows SSH on `tailscale0` only, checks Tailscale login, prints the address to use |
 
 Both scripts are idempotent: running them again is safe and does not duplicate configuration.
@@ -39,6 +39,18 @@ iwr -UseBasicParsing https://raw.githubusercontent.com/kmanisk/ssh-bootstrap/mai
 
 Older PowerShell 5.1 builds may negotiate an outdated TLS version. If the download fails, prefix the command with
 `[Net.ServicePointManager]::SecurityProtocol='Tls12';`.
+
+### OpenSSH installation
+
+The script installs OpenSSH Server through winget (`Microsoft.OpenSSH.Preview`), a single MSI from the PowerShell/Win32-OpenSSH release channel that completes in seconds. It writes:
+
+- binaries to `C:\Program Files\OpenSSH`
+- configuration to `C:\ProgramData\ssh\sshd_config`
+- the `sshd` service, set to automatic start
+
+If winget is unavailable or the install fails, the script falls back to the `OpenSSH.Server` optional feature, which downloads from Windows Update and can take 5-15 minutes. An existing installation in either location is detected and reused, so re-running the script never reinstalls OpenSSH.
+
+The OpenSSH Preview MSI adds its own firewall rule (`OpenSSH SSH Server Preview (sshd)`), scoped to the private profile and open to any source. The script disables that rule and manages a single rule named `OpenSSH-Server-In-TCP`, so `-RestrictToTailnet` is not bypassed by the MSI rule.
 
 ### Parameters
 

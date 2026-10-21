@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     Installs and configures:
-      - OpenSSH Server (Windows optional feature) with automatic start
+      - OpenSSH Server (winget Microsoft.OpenSSH.Preview, falling back to the
+        Windows optional feature) with automatic start
       - PowerShell as the default SSH shell
       - Optional public key authentication (administrators_authorized_keys + ACLs)
       - Tailscale (winget, falling back to the official MSI)
@@ -149,34 +150,80 @@ if ([Environment]::OSVersion.Version.Build -lt 17763) {
 # ---------------------------------------------------------------------------
 # OpenSSH Server
 # ---------------------------------------------------------------------------
-Write-Step 'Installing OpenSSH Server'
-$capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
-if (-not $capability) {
-    Write-Host 'OpenSSH.Server capability not found on this image.' -ForegroundColor Red
-    exit 1
+function Get-SshdExe {
+    $candidates = @(
+        (Join-Path $env:ProgramFiles 'OpenSSH\sshd.exe'),
+        (Join-Path $env:windir 'System32\OpenSSH\sshd.exe')
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
 }
 
-if ($capability.State -ne 'Installed') {
-    Write-Info ("Installing {0} (needs internet / Windows Update)..." -f $capability.Name)
+function Install-OpenSshWithWinget {
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Info 'winget is not available on this system.'
+        return $false
+    }
+    Write-Info 'Installing Microsoft.OpenSSH.Preview with winget...'
+    $wingetArgs = @(
+        'install', '--id', 'Microsoft.OpenSSH.Preview', '-e', '--silent',
+        '--accept-package-agreements', '--accept-source-agreements'
+    )
     try {
-        Add-WindowsCapability -Online -Name $capability.Name | Out-Null
+        $output = & winget.exe @wingetArgs 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn ("winget exited with code {0}" -f $LASTEXITCODE)
+            if ($output.Trim()) { Write-Info $output.Trim() }
+            return $false
+        }
     }
     catch {
-        Write-Warn ("Capability install failed: {0}" -f $_.Exception.Message)
+        Write-Warn ("winget failed: {0}" -f $_.Exception.Message)
+        return $false
     }
+    return [bool](Get-SshdExe)
+}
+
+function Install-OpenSshWithCapability {
+    $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
+    if (-not $capability) { return $false }
+    if ($capability.State -ne 'Installed') {
+        Write-Info 'Falling back to the OpenSSH.Server optional feature (Windows Update, 5-15 minutes)...'
+        try { Add-WindowsCapability -Online -Name $capability.Name | Out-Null }
+        catch { Write-Warn ("Capability install failed: {0}" -f $_.Exception.Message) }
+    }
+    return [bool](Get-SshdExe)
+}
+
+Write-Step 'Installing OpenSSH Server'
+$sshdExe = Get-SshdExe
+if ($sshdExe) {
+    Write-Info ("Already installed: {0}" -f $sshdExe)
 }
 else {
-    Write-Info 'Already installed.'
+    $installed = Install-OpenSshWithWinget
+    if (-not $installed) { $installed = Install-OpenSshWithCapability }
+    if (-not $installed) {
+        Write-Host 'OpenSSH Server could not be installed.' -ForegroundColor Red
+        Write-Host 'Manual fallback: winget install --id Microsoft.OpenSSH.Preview -e' -ForegroundColor Yellow
+        Write-Host '         or: Settings > System > Optional features > OpenSSH Server.' -ForegroundColor Yellow
+        exit 1
+    }
+    $sshdExe = Get-SshdExe
+    Write-Info ("Installed: {0}" -f $sshdExe)
 }
-
-$capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
-if ($capability.State -ne 'Installed') {
-    Write-Host 'OpenSSH Server is still not installed. Aborting.' -ForegroundColor Red
-    Write-Host 'Manual fallback: Settings > System > Optional features > OpenSSH Server.' -ForegroundColor Yellow
-    exit 1
-}
+$SshdRoot = Split-Path -Parent $sshdExe
+$UsingInboxOpenSsh = ($SshdRoot -eq (Join-Path $env:windir 'System32\OpenSSH'))
 
 Write-Step 'Configuring the sshd service'
+if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
+    Write-Host 'The sshd service is missing after installation.' -ForegroundColor Red
+    Write-Host 'Repair: winget install --id Microsoft.OpenSSH.Preview -e --force' -ForegroundColor Yellow
+    exit 1
+}
 Set-Service -Name sshd -StartupType Automatic
 Start-Service -Name sshd
 Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction SilentlyContinue
@@ -196,6 +243,14 @@ if (-not (Test-Path 'HKLM:\SOFTWARE\OpenSSH')) {
 }
 New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -Value $shellPath -PropertyType String -Force | Out-Null
 Write-Info ("DefaultShell = {0}" -f $shellPath)
+
+if (-not $UsingInboxOpenSsh) {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($machinePath -notlike "*$SshdRoot*") {
+        [Environment]::SetEnvironmentVariable('Path', $machinePath.TrimEnd(';') + ';' + $SshdRoot, 'Machine')
+        Write-Info ("Added {0} to the machine PATH." -f $SshdRoot)
+    }
+}
 
 # ---------------------------------------------------------------------------
 # sshd_config
@@ -224,9 +279,29 @@ function Set-SshdOption {
 }
 
 Write-Step 'Tuning sshd_config'
+$sshConfigDir = Split-Path -Parent $SshdConfig
+if (-not (Test-Path -LiteralPath $sshConfigDir)) {
+    New-Item -ItemType Directory -Path $sshConfigDir -Force | Out-Null
+}
 if (-not (Test-Path -LiteralPath $SshdConfig)) {
-    Write-Host ("Missing {0}" -f $SshdConfig) -ForegroundColor Red
-    exit 1
+    $template = Join-Path $SshdRoot 'sshd_config_default'
+    if (-not (Test-Path -LiteralPath $template)) { $template = Join-Path $SshdRoot 'sshd_config' }
+    if (Test-Path -LiteralPath $template) {
+        Copy-Item -LiteralPath $template -Destination $SshdConfig -Force
+        Write-Info 'Default sshd_config copied into ProgramData\ssh.'
+    }
+    else {
+        @(
+            'Port 22'
+            'PasswordAuthentication yes'
+            'PubkeyAuthentication yes'
+            'MaxAuthTries 3'
+            'LoginGraceTime 30'
+        ) | Set-Content -LiteralPath $SshdConfig -Encoding ASCII
+        Write-Info 'Minimal sshd_config created.'
+    }
+    & icacls.exe $sshConfigDir /inheritance:r /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-5-11:(OI)(CI)RX' 2>$null | Out-Null
+    & icacls.exe $SshdConfig /inheritance:r /grant '*S-1-5-18:F' /grant '*S-1-5-32-544:F' 2>$null | Out-Null
 }
 if (-not (Test-Path -LiteralPath ($SshdConfig + '.bak'))) {
     Copy-Item -LiteralPath $SshdConfig -Destination ($SshdConfig + '.bak') -Force
@@ -278,7 +353,7 @@ if ($keyValid) {
         Add-Content -LiteralPath $AdminKeys -Value $keyLine -Encoding ASCII
         Write-Info 'Key appended to administrators_authorized_keys.'
     }
-    & icacls.exe $AdminKeys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+    & icacls.exe $AdminKeys /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
     Write-Info 'ACLs restricted to Administrators and SYSTEM.'
 }
 
@@ -298,6 +373,14 @@ else {
     Write-Info 'Rule enabled.'
 }
 $rule | Get-NetFirewallPortFilter | Set-NetFirewallPortFilter -LocalPort $Port
+
+# The OpenSSH Preview MSI creates its own rule (private profile, any source).
+# Disable it so this script's rule is the single source of truth.
+$previewRules = @(Get-NetFirewallRule -DisplayName 'OpenSSH SSH Server Preview*' -ErrorAction SilentlyContinue)
+if ($previewRules.Count -gt 0) {
+    $previewRules | Set-NetFirewallRule -Enabled False
+    Write-Info 'Disabled the preview MSI firewall rule (managed rule above is used instead).'
+}
 
 if ($RestrictToTailnet) {
     $rule | Set-NetFirewallRule -RemoteAddress '100.64.0.0/10'
@@ -383,12 +466,19 @@ else {
 # ---------------------------------------------------------------------------
 # Restart and verify
 # ---------------------------------------------------------------------------
+Write-Step 'Validating the sshd configuration'
+& $sshdExe -t -f $SshdConfig
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn ('sshd -t reported a configuration error (exit {0})' -f $LASTEXITCODE)
+}
+
 Write-Step 'Restarting sshd'
 Restart-Service -Name sshd -Force
 Start-Sleep -Seconds 2
 
 $svc = Get-Service sshd
 Write-Info ("sshd: {0} / {1}" -f $svc.Status, $svc.StartType)
+Write-Info ("sshd exe: {0}" -f $sshdExe)
 
 $listen = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
 if ($listen) { Write-Info ("Listening on TCP {0}" -f $Port) }
